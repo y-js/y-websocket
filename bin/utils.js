@@ -24,7 +24,7 @@ const wsReadyStateClosed = 3 // eslint-disable-line
 const gcEnabled = process.env.GC !== 'false' && process.env.GC !== '0'
 const persistenceDir = process.env.YPERSISTENCE
 /**
- * @type {{bindState: function(string,WSSharedDoc):void, writeState:function(string,WSSharedDoc):Promise<any>, provider: any}|null}
+ * @type {{bindState: function(string,WSSharedDoc):void|Promise<void>, writeState:function(string,WSSharedDoc):Promise<any>, provider: any}|null}
  */
 let persistence = null
 if (typeof persistenceDir === 'string') {
@@ -43,7 +43,7 @@ if (typeof persistenceDir === 'string') {
         ldb.storeUpdate(docName, update)
       })
     },
-    writeState: async (docName, ydoc) => {}
+    writeState: async (docName, ydoc) => { }
   }
 }
 
@@ -104,6 +104,14 @@ class WSSharedDoc extends Y.Doc {
     this.awareness = new awarenessProtocol.Awareness(this)
     this.awareness.setLocalState(null)
     /**
+     * @type {Promise<void>|void}
+     */
+    this.whenSynced = void 0
+    /**
+     * @type {boolean}
+     */
+    this.isSynced = false
+    /**
      * @param {{ added: Array<number>, updated: Array<number>, removed: Array<number> }} changes
      * @param {Object | null} conn Origin is the connection that made the change
      */
@@ -134,6 +142,11 @@ class WSSharedDoc extends Y.Doc {
         { maxWait: CALLBACK_DEBOUNCE_MAXWAIT }
       ))
     }
+
+    if (persistence !== null) {
+      this.whenSynced = persistence.bindState(name, this)
+        .then(() => { this.isSynced = true })
+    }
   }
 }
 
@@ -147,9 +160,6 @@ class WSSharedDoc extends Y.Doc {
 const getYDoc = (docname, gc = true) => map.setIfUndefined(docs, docname, () => {
   const doc = new WSSharedDoc(docname)
   doc.gc = gc
-  if (persistence !== null) {
-    persistence.bindState(docname, doc)
-  }
   docs.set(docname, doc)
   return doc
 })
@@ -161,12 +171,17 @@ exports.getYDoc = getYDoc
  * @param {WSSharedDoc} doc
  * @param {Uint8Array} message
  */
-const messageListener = (conn, doc, message) => {
+const messageListener = async (conn, doc, message) => {
   const encoder = encoding.createEncoder()
   const decoder = decoding.createDecoder(message)
   const messageType = decoding.readVarUint(decoder)
   switch (messageType) {
     case messageSync:
+      // await the doc state being updated from persistence, if available, otherwise
+      // we may send sync step 2 too early
+      if (doc.whenSynced) {
+        await doc.whenSynced
+      }
       encoding.writeVarUint(encoder, messageSync)
       syncProtocol.readSyncMessage(decoder, encoder, doc, null)
       if (encoding.length(encoder) > 1) {
@@ -193,11 +208,16 @@ const closeConn = (doc, conn) => {
     const controlledIds = doc.conns.get(conn)
     doc.conns.delete(conn)
     awarenessProtocol.removeAwarenessStates(doc.awareness, Array.from(controlledIds), null)
+
     if (doc.conns.size === 0 && persistence !== null) {
-      // if persisted, we store state and destroy ydocument
-      persistence.writeState(doc.name, doc).then(() => {
-        doc.destroy()
-      })
+      if (doc.isSynced) {
+        // if persisted and the state has finished loading from the database,
+        // we write the state back to persisted storage
+        persistence.writeState(doc.name, doc).then(() => {
+          doc.destroy()
+        })
+      }
+
       docs.delete(doc.name)
     }
   }
@@ -227,11 +247,12 @@ const pingTimeout = 30000
  * @param {any} req
  * @param {any} opts
  */
-exports.setupWSConnection = (conn, req, { docName = req.url.slice(1).split('?')[0], gc = true } = {}) => {
+exports.setupWSConnection = async (conn, req, { docName = req.url.slice(1).split('?')[0], gc = true } = {}) => {
   conn.binaryType = 'arraybuffer'
   // get doc, initialize if it does not exist yet
   const doc = getYDoc(docName, gc)
   doc.conns.set(conn, new Set())
+
   // listen and reply to events
   conn.on('message', /** @param {ArrayBuffer} message */ message => messageListener(conn, doc, new Uint8Array(message)))
 
@@ -260,9 +281,16 @@ exports.setupWSConnection = (conn, req, { docName = req.url.slice(1).split('?')[
   conn.on('pong', () => {
     pongReceived = true
   })
-  // put the following in a variables in a block so the interval handlers don't keep in in
-  // scope
+
+  // put the following in a variables in a block so the interval handlers don't
+  // keep in scope
   {
+    // await the doc state being updated from persistence, if available, otherwise
+    // we may send sync step 1 too early
+    if (doc.whenSynced) {
+      await doc.whenSynced
+    }
+
     // send sync step 1
     const encoder = encoding.createEncoder()
     encoding.writeVarUint(encoder, messageSync)
